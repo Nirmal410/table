@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 
 const props = defineProps({
   jsonData: {
@@ -22,68 +22,118 @@ const headerContainer = ref(null)
 const bodyContainer = ref(null)
 const scrollTop = ref(0)
 
-// Data from parent
+// Headers from parent
 const headers = computed(() => props.jsonData.headers || [])
-const allRows = computed(() => props.jsonData.rows || [])
 
-// Search & filter state (local to the table)
+// Determine if we're using lazy loading or pre-generated rows
+const isLazyMode = computed(() => typeof props.jsonData.getRow === 'function')
+const totalRowCount = computed(() => {
+  if (isLazyMode.value) {
+    return props.jsonData.totalRows || 0
+  }
+  return props.jsonData.rows?.length || 0
+})
+
+// Search & filter state
 const searchTerm = ref('')
 const selectedColumn = ref('')
 
-// Filter rows by search term and optional selected column
-const filteredRows = computed(() => {
-  const term = String(searchTerm.value || '').trim().toLowerCase()
-  if (!term) return allRows.value
+// Cache for lazy-generated rows (only for search/filter)
+const rowCache = ref(new Map())
 
-  // If a specific column is selected, only search that column
-  if (selectedColumn.value) {
-    return allRows.value.filter(r => String(r[selectedColumn.value] ?? '').toLowerCase().includes(term))
+// Get row by index (lazy or direct)
+function getRowByIndex(index) {
+  if (isLazyMode.value) {
+    // Check cache first
+    if (rowCache.value.has(index)) {
+      return rowCache.value.get(index)
+    }
+    // Generate and cache
+    const row = props.jsonData.getRow(index)
+    rowCache.value.set(index, row)
+    return row
+  }
+  return props.jsonData.rows[index]
+}
+
+// For search: we need to generate rows on-demand
+// This is still better than generating all upfront
+const filteredIndices = computed(() => {
+  const term = String(searchTerm.value || '').trim().toLowerCase()
+  
+  if (!term) {
+    // No search - return all indices
+    return Array.from({ length: totalRowCount.value }, (_, i) => i)
   }
 
-  // Otherwise search across all columns
-  return allRows.value.filter(row => {
-    return headers.value.some(h => String(row[h] ?? '').toLowerCase().includes(term))
-  })
+  // Search mode - generate rows as needed for filtering
+  const matches = []
+  for (let i = 0; i < totalRowCount.value; i++) {
+    const row = getRowByIndex(i)
+    
+    if (selectedColumn.value) {
+      if (String(row[selectedColumn.value] ?? '').toLowerCase().includes(term)) {
+        matches.push(i)
+      }
+    } else {
+      const found = headers.value.some(h => 
+        String(row[h] ?? '').toLowerCase().includes(term)
+      )
+      if (found) matches.push(i)
+    }
+  }
+  
+  return matches
 })
 
-// Virtual scrolling calculations - DOM reuse logic
+// Virtual scrolling calculations
 const startIndex = computed(() => {
   return Math.floor(scrollTop.value / props.rowHeight)
 })
 
 const endIndex = computed(() => {
-  return Math.min(startIndex.value + props.visibleCount, filteredRows.value.length)
+  return Math.min(startIndex.value + props.visibleCount, filteredIndices.value.length)
 })
 
-// Only render visible rows (DOM reuse)
+// Only render visible rows (true DOM reuse - only ~20 rows in DOM)
 const visibleRows = computed(() => {
-  return filteredRows.value.slice(startIndex.value, endIndex.value)
+  const result = []
+  for (let i = startIndex.value; i < endIndex.value; i++) {
+    const dataIndex = filteredIndices.value[i]
+    result.push(getRowByIndex(dataIndex))
+  }
+  return result
 })
 
-// Spacer calculations for virtual scrolling
+// Spacer calculations
 const topSpacer = computed(() => startIndex.value * props.rowHeight)
 const bottomSpacer = computed(() => {
-  return Math.max(0, (filteredRows.value.length - endIndex.value) * props.rowHeight)
+  return Math.max(0, (filteredIndices.value.length - endIndex.value) * props.rowHeight)
 })
 
-const totalHeight = computed(() => filteredRows.value.length * props.rowHeight)
+const totalHeight = computed(() => filteredIndices.value.length * props.rowHeight)
 
-// Scroll handler for vertical and horizontal sync
+// Clear cache when search changes (optional optimization)
+watch([searchTerm, selectedColumn], () => {
+  if (isLazyMode.value && rowCache.value.size > 1000) {
+    // Keep cache reasonable size
+    rowCache.value.clear()
+  }
+})
+
+// Scroll handlers
 function handleScroll() {
   const bodyEl = bodyContainer.value
   const headerEl = headerContainer.value
   if (!bodyEl) return
   
-  // Update vertical scroll position
   scrollTop.value = bodyEl.scrollTop
   
-  // Sync horizontal scroll with header - prevent shifting
   if (headerEl && headerEl.scrollLeft !== bodyEl.scrollLeft) {
     headerEl.scrollLeft = bodyEl.scrollLeft
   }
 }
 
-// Prevent header from scrolling independently
 function handleHeaderScroll() {
   const headerEl = headerContainer.value
   const bodyEl = bodyContainer.value
@@ -93,7 +143,7 @@ function handleHeaderScroll() {
   }
 }
 
-// Set equal column widths for perfect alignment
+// Column width synchronization
 function setColumnWidths() {
   nextTick(() => {
     const headerTable = headerContainer.value?.querySelector('table')
@@ -101,26 +151,19 @@ function setColumnWidths() {
     
     if (!headerTable || !bodyTable) return
     
-    // Calculate exact column widths to prevent shifting
     const bodyWrapper = bodyContainer.value
-    const headerWrapper = headerContainer.value
-    
-    // Use the full client width for calculations
     const fullWidth = bodyWrapper.clientWidth
     const columnWidth = Math.floor(fullWidth / headers.value.length)
     const columnWidths = headers.value.map(() => columnWidth)
     
-    // Set table widths to be wider than container to enable horizontal scrolling
     const totalWidth = columnWidths.reduce((sum, width) => sum + width, 0)
-    const minTableWidth = Math.max(totalWidth, fullWidth + 200) // Add extra width for scrolling
+    const minTableWidth = Math.max(totalWidth, fullWidth + 200)
     
-    // Ensure both tables have exactly the same width
     headerTable.style.width = `${minTableWidth}px`
     bodyTable.style.width = `${minTableWidth}px`
     headerTable.style.minWidth = `${minTableWidth}px`
     bodyTable.style.minWidth = `${minTableWidth}px`
     
-    // Set individual column widths
     const headerCells = headerTable.querySelectorAll('th')
     const bodyRows = bodyTable.querySelectorAll('tr')
     
@@ -147,11 +190,8 @@ onMounted(() => {
   setColumnWidths()
 })
 
-// Watch for data changes and reset widths
-computed(() => {
-  if (visibleRows.value.length > 0) {
-    nextTick(() => setColumnWidths())
-  }
+watch(visibleRows, () => {
+  nextTick(() => setColumnWidths())
 })
 </script>
 
@@ -164,7 +204,9 @@ computed(() => {
         <option value="">All columns</option>
         <option v-for="h in headers" :key="h" :value="h">{{ h }}</option>
       </select>
+      <span class="row-count">{{ filteredIndices.length }} / {{ totalRowCount }} rows</span>
     </div>
+    
     <!-- Fixed Header -->
     <div 
       class="header-wrapper" 
@@ -189,10 +231,8 @@ computed(() => {
       @scroll="handleScroll"
     >
       <div class="virtual-content" :style="{ height: totalHeight + 'px' }">
-        <!-- Top spacer -->
         <div :style="{ height: topSpacer + 'px' }"></div>
         
-        <!-- Visible rows (DOM reuse - only 20 rows rendered) -->
         <table class="table body-table">
           <tbody>
             <tr 
@@ -207,7 +247,6 @@ computed(() => {
           </tbody>
         </table>
         
-        <!-- Bottom spacer -->
         <div :style="{ height: bottomSpacer + 'px' }"></div>
       </div>
     </div>
@@ -215,9 +254,6 @@ computed(() => {
 </template>
 
 <style scoped>
-body{
-  background: linear-gradient(135deg, #118a8a 0%, #b4adbb 100%);
-}
 .virtual-table-container {
   height: 600px;
   border: 1px solid #ddd;
@@ -226,32 +262,27 @@ body{
   background: rgb(43, 41, 41);
 }
 
-/* Header */
 .header-wrapper {
   background: #303131;
   border-bottom: 2px solid #dee2e6;
   overflow-x: auto;
   overflow-y: hidden;
   flex-shrink: 0;
-  scrollbar-width: none; /* Firefox */
-  -ms-overflow-style: none; /* IE and Edge */
-  /* Reserve space for body scrollbar to prevent shifting */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   padding-right: 8px;
   box-sizing: border-box;
 }
 
 .header-wrapper::-webkit-scrollbar {
-  display: none; /* Chrome, Safari, Opera */
+  display: none;
 }
 
-/* Body */
 .body-wrapper {
   flex: 1;
   overflow: auto;
   position: relative;
-  /* Ensure consistent scrollbar space */
   box-sizing: border-box;
-  /* Prevent content shift at scroll boundaries */
   scroll-padding: 0;
 }
 
@@ -259,7 +290,6 @@ body{
   position: relative;
 }
 
-/* Tables */
 .table {
   border-collapse: collapse;
   table-layout: fixed;
@@ -267,14 +297,13 @@ body{
 }
 
 .header-table {
-  background: #f6f2f2; /* changed from dark to white */
+  background: #f6f2f2;
 }
 
 .body-table {
-  background: #f6f2f2; /* changed from gray/brown tone to white */
+  background: #f6f2f2;
 }
 
-/* Cells */
 th, td {
   padding: 12px 16px;
   text-align: left;
@@ -286,33 +315,26 @@ th, td {
 }
 
 th {
-  background: #ffffff; /* keep header cells white */
+  background: #ffffff;
   font-weight: 600;
-  color: #212529; /* darker text for contrast */
+  color: #212529;
   border-bottom: 1px solid #dee2e6;
 }
 
 td {
-  color: #212529; /* ensure body text is dark on white */
+  color: #212529;
   border-bottom: 1px solid #f1f3f4;
 }
 
-/* Row styling */
 .table-row:hover {
   background-color: #c9ced3;
 }
 
-/* .table-row:nth-child(even) {
-  background-color: #161616;
-} */
-
-/* Remove last border */
 th:last-child,
 td:last-child {
   border-right: none;
 }
 
-/* Scrollbar styling */
 .body-wrapper::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -331,7 +353,6 @@ td:last-child {
   background: #a8a8a8;
 }
 
-/* Search / filter controls */
 .table-controls {
   display: flex;
   gap: 8px;
@@ -354,5 +375,13 @@ td:last-child {
   border: 1px solid #d0d0d0;
   border-radius: 4px;
   background: #fff;
+}
+
+.row-count {
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #666;
+  background: #f0f0f0;
+  border-radius: 4px;
 }
 </style>
