@@ -32,7 +32,7 @@ const jsonData = computed(() => ({
 
 <template>
   <div class="app">
-    <h1>Virtual Table with DOM Reuse + Lazy Loading</h1>
+    <h1>Virtual Table</h1>
     <VirtualTable 
       :json-data="jsonData"
       :row-height="40"
